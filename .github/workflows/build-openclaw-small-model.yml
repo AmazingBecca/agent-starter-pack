@@ -1,0 +1,113 @@
+name: Build small Ollama model for OpenClaw
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-small-model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      MODEL: qwen3.5:0.8b
+      WORK: ${{ github.workspace }}/small-model-build
+
+    steps:
+      - name: Check out staging branch
+        uses: actions/checkout@v4
+
+      - name: Download official Ollama runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/ollama-root" "$WORK/models" "$WORK/out" "$WORK/parts"
+          curl -fsSLo "$WORK/ollama-linux-amd64.tar.zst" \
+            https://ollama.com/download/ollama-linux-amd64.tar.zst
+          tar --zstd -xf "$WORK/ollama-linux-amd64.tar.zst" -C "$WORK/ollama-root"
+          "$WORK/ollama-root/bin/ollama" --version
+
+      - name: Pull and verify qwen3.5 0.8B
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OLLAMA_HOST=127.0.0.1:11434
+          export OLLAMA_MODELS="$WORK/models"
+          export OLLAMA_CONTEXT_LENGTH=12288
+          "$WORK/ollama-root/bin/ollama" serve > "$WORK/ollama.log" 2>&1 &
+          OLLAMA_PID=$!
+          trap 'kill "$OLLAMA_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:11434/api/version >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:11434/api/version
+          "$WORK/ollama-root/bin/ollama" pull "$MODEL"
+          "$WORK/ollama-root/bin/ollama" show "$MODEL"
+          curl -fsS http://127.0.0.1:11434/api/chat \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen3.5:0.8b","messages":[{"role":"user","content":"Reply with exactly SMALL_MODEL_OK"}],"stream":false,"keep_alive":0,"options":{"num_ctx":12288,"num_predict":64,"thinking":false}}' \
+            > "$WORK/smoke.json"
+          grep -q 'SMALL_MODEL_OK' "$WORK/smoke.json"
+
+      - name: Archive, verify, and split model
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --zstd -cf "$WORK/out/ollama-model-qwen3.5-0.8b.tar.zst" -C "$WORK" models
+          sha256sum "$WORK/out/ollama-model-qwen3.5-0.8b.tar.zst" > "$WORK/out/ollama-model-qwen3.5-0.8b.tar.zst.sha256"
+          split -b 350000000 -d -a 2 \
+            "$WORK/out/ollama-model-qwen3.5-0.8b.tar.zst" \
+            "$WORK/parts/ollama-model-qwen3.5-0.8b.tar.zst.part-"
+          find "$WORK/parts" -type f -print0 | sort -z | xargs -0 sha256sum > "$WORK/out/parts.sha256"
+          find "$WORK/parts" -type f -printf '%f %s bytes\n' | sort > "$WORK/out/parts.sizes"
+          count="$(find "$WORK/parts" -type f | wc -l)"
+          test "$count" -ge 2
+          test "$count" -le 4
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen35-08b-transfer-manifest
+          path: |
+            small-model-build/out/ollama-model-qwen3.5-0.8b.tar.zst.sha256
+            small-model-build/out/parts.sha256
+            small-model-build/out/parts.sizes
+            small-model-build/smoke.json
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload part 00
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen35-08b-part-00
+          path: small-model-build/parts/ollama-model-qwen3.5-0.8b.tar.zst.part-00
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part 01
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen35-08b-part-01
+          path: small-model-build/parts/ollama-model-qwen3.5-0.8b.tar.zst.part-01
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part 02 when present
+        if: ${{ hashFiles('small-model-build/parts/ollama-model-qwen3.5-0.8b.tar.zst.part-02') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen35-08b-part-02
+          path: small-model-build/parts/ollama-model-qwen3.5-0.8b.tar.zst.part-02
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part 03 when present
+        if: ${{ hashFiles('small-model-build/parts/ollama-model-qwen3.5-0.8b.tar.zst.part-03') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen35-08b-part-03
+          path: small-model-build/parts/ollama-model-qwen3.5-0.8b.tar.zst.part-03
+          compression-level: 0
+          retention-days: 3

@@ -1,177 +1,161 @@
-name: Build OpenClaw + Ollama offline bundle
+name: Split accepted Ollama artifacts for transfer
 
 on:
-  push:
-    branches:
-      - openclaw-ollama-bootstrap-20260724
   pull_request:
     branches:
       - main
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
-  build:
+  split:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      MODEL: qwen3.5:2b
-      WORK: ${{ github.workspace }}/offline-build
+    timeout-minutes: 45
 
     steps:
-      - name: Check out staging branch
-        uses: actions/checkout@v4
-
-      - name: Install supported Node runtime
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-
-      - name: Build portable OpenClaw runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$WORK/openclaw/node" "$WORK/openclaw/prefix" "$WORK/out"
-
-          NODE_VERSION="$(node -p 'process.versions.node')"
-          NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.xz"
-          curl -fsSLo "$WORK/$NODE_ARCHIVE" \
-            "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}"
-          curl -fsSLo "$WORK/SHASUMS256.txt" \
-            "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt"
-          (
-            cd "$WORK"
-            grep "  ${NODE_ARCHIVE}$" SHASUMS256.txt | sha256sum -c -
-          )
-          tar -xJf "$WORK/$NODE_ARCHIVE" \
-            -C "$WORK/openclaw/node" --strip-components=1
-
-          "$WORK/openclaw/node/bin/npm" install --global \
-            --prefix "$WORK/openclaw/prefix" \
-            --omit=dev \
-            openclaw@latest
-
-          export PATH="$WORK/openclaw/node/bin:$WORK/openclaw/prefix/bin:$PATH"
-          OPENCLAW_VERSION="$(openclaw --version | head -n1)"
-          NPM_VERSION="$(npm view openclaw version)"
-          printf 'node=%s\nopenclaw_cli=%s\nopenclaw_npm=%s\nbuilt_at=%s\n' \
-            "$NODE_VERSION" "$OPENCLAW_VERSION" "$NPM_VERSION" "$(date -u +%FT%TZ)" \
-            > "$WORK/openclaw/MANIFEST.txt"
-
-          cat > "$WORK/openclaw/install.sh" <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          PREFIX="${1:-/opt/openclaw-local}"
-          rm -rf "$PREFIX"
-          mkdir -p "$PREFIX"
-          cp -a "$SOURCE_DIR/node" "$PREFIX/node"
-          cp -a "$SOURCE_DIR/prefix" "$PREFIX/prefix"
-          install -d /usr/local/bin
-          cat > /usr/local/bin/openclaw <<EOF
-          #!/usr/bin/env bash
-          export PATH="$PREFIX/node/bin:\$PATH"
-          exec "$PREFIX/prefix/bin/openclaw" "\$@"
-          EOF
-          chmod 0755 /usr/local/bin/openclaw
-          openclaw --version
-          SCRIPT
-          chmod 0755 "$WORK/openclaw/install.sh"
-
-          tar --zstd -cf "$WORK/out/openclaw-runtime.tar.zst" -C "$WORK" openclaw
-          sha256sum "$WORK/out/openclaw-runtime.tar.zst" > "$WORK/out/openclaw-runtime.tar.zst.sha256"
-
-      - name: Build portable Ollama runtime and pull model
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$WORK/ollama/root" "$WORK/ollama-models" "$WORK/out"
-
-          curl -fsSLo "$WORK/ollama-linux-amd64.tar.zst" \
-            https://ollama.com/download/ollama-linux-amd64.tar.zst
-          tar --zstd -xf "$WORK/ollama-linux-amd64.tar.zst" -C "$WORK/ollama/root"
-
-          OLLAMA_BIN="$WORK/ollama/root/bin/ollama"
-          test -x "$OLLAMA_BIN"
-          OLLAMA_VERSION="$($OLLAMA_BIN --version 2>&1 | head -n1)"
-          printf 'ollama=%s\nmodel=%s\nbuilt_at=%s\n' \
-            "$OLLAMA_VERSION" "$MODEL" "$(date -u +%FT%TZ)" \
-            > "$WORK/ollama/MANIFEST.txt"
-
-          export OLLAMA_HOST=127.0.0.1:11434
-          export OLLAMA_MODELS="$WORK/ollama-models"
-          "$OLLAMA_BIN" serve > "$WORK/ollama-serve.log" 2>&1 &
-          OLLAMA_PID=$!
-          trap 'kill "$OLLAMA_PID" 2>/dev/null || true' EXIT
-
-          for _ in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:11434/api/version >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:11434/api/version
-          "$OLLAMA_BIN" pull "$MODEL"
-          "$OLLAMA_BIN" list
-
-          curl -fsS http://127.0.0.1:11434/api/chat \
-            -H 'Content-Type: application/json' \
-            -d '{"model":"qwen3.5:2b","messages":[{"role":"user","content":"Reply with exactly OLLAMA_OK"}],"stream":false,"keep_alive":0,"options":{"num_ctx":4096}}' \
-            > "$WORK/ollama-smoke.json"
-          grep -q 'OLLAMA_OK' "$WORK/ollama-smoke.json"
-
-          cat > "$WORK/ollama/install.sh" <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          PREFIX="${1:-/opt/ollama-local}"
-          rm -rf "$PREFIX"
-          mkdir -p "$PREFIX"
-          cp -a "$SOURCE_DIR/root" "$PREFIX/root"
-          install -d /usr/local/bin
-          cat > /usr/local/bin/ollama <<EOF
-          #!/usr/bin/env bash
-          exec "$PREFIX/root/bin/ollama" "\$@"
-          EOF
-          chmod 0755 /usr/local/bin/ollama
-          ollama --version
-          SCRIPT
-          chmod 0755 "$WORK/ollama/install.sh"
-
-          tar --zstd -cf "$WORK/out/ollama-runtime.tar.zst" -C "$WORK" ollama
-          sha256sum "$WORK/out/ollama-runtime.tar.zst" > "$WORK/out/ollama-runtime.tar.zst.sha256"
-
-          tar --zstd -cf "$WORK/out/ollama-model-qwen3.5-2b.tar.zst" -C "$WORK" ollama-models
-          sha256sum "$WORK/out/ollama-model-qwen3.5-2b.tar.zst" > "$WORK/out/ollama-model-qwen3.5-2b.tar.zst.sha256"
-
-      - name: Upload OpenClaw runtime artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: openclaw-runtime
-          path: |
-            offline-build/out/openclaw-runtime.tar.zst
-            offline-build/out/openclaw-runtime.tar.zst.sha256
-          compression-level: 0
-          retention-days: 3
-
-      - name: Upload Ollama runtime artifact
-        uses: actions/upload-artifact@v4
+      - name: Download accepted Ollama runtime
+        uses: actions/download-artifact@v4
         with:
           name: ollama-runtime
-          path: |
-            offline-build/out/ollama-runtime.tar.zst
-            offline-build/out/ollama-runtime.tar.zst.sha256
+          path: accepted/ollama-runtime
+          run-id: 30064225909
+          github-token: ${{ github.token }}
+
+      - name: Download accepted Ollama model
+        uses: actions/download-artifact@v4
+        with:
+          name: ollama-model-qwen3.5-2b
+          path: accepted/ollama-model
+          run-id: 30064225909
+          github-token: ${{ github.token }}
+
+      - name: Verify accepted archives and split below connector ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p transfer/runtime transfer/model transfer/manifest
+
+          verify_archive() {
+            local archive="$1"
+            local checksum_file="$2"
+            local expected actual
+            expected="$(awk '{print $1}' "$checksum_file")"
+            actual="$(sha256sum "$archive" | awk '{print $1}')"
+            printf 'archive=%s\nexpected=%s\nactual=%s\n' "$archive" "$expected" "$actual"
+            test "$expected" = "$actual"
+          }
+
+          verify_archive \
+            accepted/ollama-runtime/ollama-runtime.tar.zst \
+            accepted/ollama-runtime/ollama-runtime.tar.zst.sha256
+          verify_archive \
+            accepted/ollama-model/ollama-model-qwen3.5-2b.tar.zst \
+            accepted/ollama-model/ollama-model-qwen3.5-2b.tar.zst.sha256
+
+          split -b 400000000 -d -a 2 \
+            accepted/ollama-runtime/ollama-runtime.tar.zst \
+            transfer/runtime/ollama-runtime.tar.zst.part-
+          split -b 400000000 -d -a 2 \
+            accepted/ollama-model/ollama-model-qwen3.5-2b.tar.zst \
+            transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-
+
+          test "$(find transfer/runtime -type f | wc -l)" -eq 4
+          test "$(find transfer/model -type f | wc -l)" -eq 7
+
+          cp accepted/ollama-runtime/ollama-runtime.tar.zst.sha256 transfer/manifest/
+          cp accepted/ollama-model/ollama-model-qwen3.5-2b.tar.zst.sha256 transfer/manifest/
+          find transfer/runtime transfer/model -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > transfer/manifest/parts.sha256
+          find transfer/runtime transfer/model -type f -printf '%p %s bytes\n' \
+            | sort > transfer/manifest/parts.sizes
+
+      - name: Upload transfer manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-transfer-manifest
+          path: transfer/manifest/
           compression-level: 0
           retention-days: 3
 
-      - name: Upload Ollama model artifact
+      - name: Upload runtime part 00
         uses: actions/upload-artifact@v4
         with:
-          name: ollama-model-qwen3.5-2b
-          path: |
-            offline-build/out/ollama-model-qwen3.5-2b.tar.zst
-            offline-build/out/ollama-model-qwen3.5-2b.tar.zst.sha256
+          name: ollama-runtime-part-00
+          path: transfer/runtime/ollama-runtime.tar.zst.part-00
+          compression-level: 0
+          retention-days: 3
+      - name: Upload runtime part 01
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-runtime-part-01
+          path: transfer/runtime/ollama-runtime.tar.zst.part-01
+          compression-level: 0
+          retention-days: 3
+      - name: Upload runtime part 02
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-runtime-part-02
+          path: transfer/runtime/ollama-runtime.tar.zst.part-02
+          compression-level: 0
+          retention-days: 3
+      - name: Upload runtime part 03
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-runtime-part-03
+          path: transfer/runtime/ollama-runtime.tar.zst.part-03
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload model part 00
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-00
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-00
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 01
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-01
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-01
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 02
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-02
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-02
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 03
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-03
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-03
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 04
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-04
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-04
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 05
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-05
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-05
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 06
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-06
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-06
           compression-level: 0
           retention-days: 3

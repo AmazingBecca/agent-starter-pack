@@ -1,10 +1,10 @@
-# Shared Composition Stack v2
+# Shared Composition Stack v3
 
 This directory provides a reusable, repo-local composition bootstrap without changing the repository's normal dependency manifests or installing packages globally.
 
 ## Security model
 
-A reviewed install is **offline, wheel-only, and exact-hash locked**. The bootstrap does not resolve package ranges from PyPI or another network index. It requires three operator-supplied inputs:
+A reviewed install is **offline, wheel-only, exact-hash locked, and dependency-traversal disabled**. The bootstrap does not resolve package ranges from PyPI or another network index. It requires three operator-supplied inputs:
 
 1. a per-Python/per-platform lock file;
 2. the independently authenticated SHA-256 of that exact lock file; and
@@ -16,19 +16,21 @@ Every lock line must use this canonical form:
 NAME==VERSION --hash=sha256:<64 lowercase hex>
 ```
 
-Every direct and transitive package needed by the selected profile must be present in the lock. Options, URLs, markers, ranges, unhashed packages, duplicate package names, and source distributions are rejected. A different platform or Python version should use a different complete lock rather than conditional entries in one mutable lock.
+Every direct and transitive package needed by the selected profile must be present in the lock. Options, URLs, markers, ranges, unhashed packages, duplicate package names, and source distributions are rejected from the lock. A different platform or Python version should use a different complete lock rather than conditional entries in one mutable lock.
 
 The bootstrap creates a **fresh private environment for every run** under `.stack/runtime/runs/<profile>/<random-id>`. It never executes or incrementally updates an existing ignored `.stack/.venv`. This also prevents a prior `mirofish` install from contaminating a later `base` environment.
 
-The wheelhouse is snapshotted into private run staging through no-follow regular-file reads before pip starts. Pip runs with an allowlisted environment, isolated configuration, `--no-index`, `--only-binary=:all:`, and `--require-hashes`. The resulting pip report must bind exactly the package/version/artifact hashes in the supplied lock.
+The wheelhouse is snapshotted into private run staging through no-follow regular-file reads before pip starts. Before any candidate wheel is installed, a verifier running inside the newly created empty venv parses each locked wheel's `METADATA` using pip's vendored PEP 508 parser. It requires wheel name/version/hash identity to match the lock, rejects direct-URL dependencies, requires every active dependency to be present in the complete lock at a compatible locked version, and propagates requested extras while evaluating markers for the actual target interpreter/platform.
 
-Receipts are created with exclusive no-follow output semantics and bind the bootstrap bytes, interpreter bytes, lock bytes, wheel bytes, installed package/artifact identities, and pip report. Receipts are **advisory install evidence only**. They do not authorize merge, promotion, completion, production use, or later runtime execution.
+Only after that metadata closure passes does pip install the explicitly locked wheels. Pip runs with an allowlisted environment, isolated configuration, `--no-index`, `--only-binary=:all:`, `--require-hashes`, and **`--no-deps`**. Disabling resolver dependency traversal is deliberate: `--no-index` alone does not prevent a wheel's `Requires-Dist` direct URL from being fetched. The resulting pip report must bind exactly the package/version/artifact hashes in the supplied lock.
+
+Receipts are created with exclusive no-follow output semantics and bind the bootstrap bytes, interpreter bytes, implementation/cache tag/platform identity, lock bytes, wheel bytes, validated dependency-metadata closure, installed package/artifact identities, and pip report. Receipts are **advisory install evidence only**. They do not authorize merge, promotion, completion, production use, or later runtime execution.
 
 ## Profiles
 
 `base` requires locked wheels for the provider-neutral HTTP/config/model-validation and deterministic test roots.
 
-`mirofish` additionally requires the MiroFish composition roots, including Flask, OpenAI-compatible client support, Zep Cloud, CAMEL/OASIS, PyMuPDF, and charset tools. Because `camel-oasis==0.2.5` requires Python `<3.12`, an actual `mirofish` install requires CPython 3.11. A dry-run may be inspected from another Python version.
+`mirofish` additionally requires the MiroFish composition roots, including Flask, OpenAI-compatible client support, Zep Cloud, CAMEL/OASIS, PyMuPDF, and charset tools. Because `camel-oasis==0.2.5` requires Python `<3.12`, an actual `mirofish` install requires **CPython 3.11**. PyPy 3.11 and other Python implementations are rejected. A dry-run may be inspected from another Python version or implementation.
 
 ## Dry-run
 
@@ -60,6 +62,8 @@ The bootstrap intentionally does **not** provide a networked "resolve latest dep
 ## Runtime boundary
 
 This bootstrap authenticates and reconstructs an install. It is **not an OS sandbox for code that later runs from that environment**. A repository or model task that can execute arbitrary installed code still needs an external filesystem/network/process containment boundary appropriate to that repository's authority level. Do not infer runtime isolation from an install receipt.
+
+This contract also does not claim protection against a hostile same-UID process mutating the private staging tree during a run. If that threat model matters, execute the bootstrap inside a separately controlled sandbox or immutable build environment rather than extending receipt metadata and calling it isolation.
 
 ## Composition principle
 

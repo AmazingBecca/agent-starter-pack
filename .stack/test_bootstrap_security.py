@@ -3,16 +3,20 @@ from __future__ import annotations
 
 import base64
 import csv
+import functools
 import hashlib
+import http.server
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import socketserver
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 
@@ -33,18 +37,23 @@ def load_bootstrap():
     return mod
 
 
-def make_wheel(directory: Path, project: str, version: str = "1.0.0") -> tuple[Path, str]:
+def make_wheel(
+    directory: Path,
+    project: str,
+    version: str = "1.0.0",
+    requires: list[str] | None = None,
+) -> tuple[Path, str]:
     dist = project.replace("-", "_")
     import_name = dist.replace(".", "_")
     dist_info = f"{dist}-{version}.dist-info"
     wheel = directory / f"{dist}-{version}-py3-none-any.whl"
+    metadata = "Metadata-Version: 2.1\n" + f"Name: {project}\nVersion: {version}\n"
+    for requirement in requires or []:
+        metadata += f"Requires-Dist: {requirement}\n"
+    metadata += "\n"
     files: dict[str, bytes] = {
         f"{import_name}/__init__.py": f'__version__ = "{version}"\n'.encode(),
-        f"{dist_info}/METADATA": (
-            "Metadata-Version: 2.1\n"
-            f"Name: {project}\n"
-            f"Version: {version}\n\n"
-        ).encode(),
+        f"{dist_info}/METADATA": metadata.encode(),
         f"{dist_info}/WHEEL": (
             "Wheel-Version: 1.0\n"
             "Generator: shared-stack-security-test\n"
@@ -93,6 +102,13 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
         with self.assertRaises(self.mod.Refused):
             self.mod.validate_roots("base", lock)
 
+    def test_mirofish_rejects_non_cpython_311(self) -> None:
+        with self.assertRaises(self.mod.Refused):
+            self.mod.validate_profile_runtime("mirofish", "pypy", (3, 11))
+        with self.assertRaises(self.mod.Refused):
+            self.mod.validate_profile_runtime("mirofish", "cpython", (3, 12))
+        self.mod.validate_profile_runtime("mirofish", "cpython", (3, 11))
+
     def test_write_new_refuses_preexisting_symlink_and_preserves_target(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -118,7 +134,7 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
             )
             plan = json.loads(result.stdout)
             self.assertEqual(plan["profile"], "mirofish")
-            self.assertEqual(plan["install"], "offline-wheelhouse-only")
+            self.assertEqual(plan["install"], "offline-wheelhouse-only-no-deps")
             self.assertFalse((stack / "runtime").exists())
 
     def test_exact_lock_mismatch_fails_before_runtime_mutation(self) -> None:
@@ -156,7 +172,64 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
             link_wh = root / "link-wheels"
             link_wh.symlink_to(real_wh, target_is_directory=True)
             with self.assertRaises(self.mod.Refused):
-                self.mod.snapshot_wheels(link_wh, root / "snapshot", {"x": {"version": "1", "sha256": "0" * 64}})
+                self.mod.snapshot_wheels(
+                    link_wh,
+                    root / "snapshot",
+                    {"x": {"version": "1", "sha256": "0" * 64}},
+                )
+
+    def test_direct_url_dependency_is_rejected_before_any_network_request(self) -> None:
+        roots = ["httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis"]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            stack = root / ".stack"
+            stack.mkdir(mode=0o700)
+            script = stack / "bootstrap.py"
+            shutil.copyfile(BOOTSTRAP, script)
+
+            served = root / "served"
+            served.mkdir()
+            evil, _ = make_wheel(served, "evil")
+            hits: list[str] = []
+
+            class Handler(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, fmt, *args):
+                    pass
+
+                def do_GET(self):
+                    hits.append(self.path)
+                    return super().do_GET()
+
+            handler = functools.partial(Handler, directory=str(served))
+            server = socketserver.TCPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                wheelhouse = root / "wheelhouse"
+                wheelhouse.mkdir()
+                lock_lines: list[str] = []
+                for project in roots:
+                    requires = [f"evil @ http://127.0.0.1:{port}/{evil.name}"] if project == "httpx" else []
+                    _wheel, digest = make_wheel(wheelhouse, project, requires=requires)
+                    lock_lines.append(f"{project}==1.0.0 --hash=sha256:{digest}")
+                lock_bytes = ("\n".join(lock_lines) + "\n").encode()
+                lock = root / "base.lock"
+                lock.write_bytes(lock_bytes)
+                result = subprocess.run(
+                    [sys.executable, str(script), "--profile", "base", "--lock", str(lock),
+                     "--lock-sha256", sha256(lock_bytes), "--wheelhouse", str(wheelhouse)],
+                    text=True,
+                    capture_output=True,
+                    env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("direct URL dependency forbidden", result.stderr)
+            self.assertEqual(hits, [], "dependency metadata caused a network request before rejection")
 
     def test_offline_install_uses_fresh_run_and_never_touches_legacy_paths(self) -> None:
         roots = ["httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis"]
@@ -167,7 +240,6 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
             script = stack / "bootstrap.py"
             shutil.copyfile(BOOTSTRAP, script)
 
-            # Predecessor-v1 attack surfaces: a hostile ignored interpreter and receipt symlink.
             legacy_python = stack / ".venv" / "bin" / "python"
             legacy_python.parent.mkdir(parents=True)
             marker = root / "legacy-executed"
@@ -204,13 +276,19 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
                 self.assertTrue(receipt.is_file())
                 receipts.append(receipt)
                 obj = json.loads(receipt.read_text())
-                self.assertEqual(obj["schema"], "amazingbecca-shared-composition-stack-v2")
+                self.assertEqual(obj["schema"], "amazingbecca-shared-composition-stack-v3")
+                self.assertEqual(obj["python_implementation"], "cpython")
+                self.assertTrue(obj["dependency_metadata_validated"])
+                self.assertFalse(obj["dependency_traversal"])
                 self.assertFalse(obj["network_install"])
                 self.assertFalse(obj["source_distribution_builds"])
                 self.assertFalse(obj["reused_environment"])
                 self.assertFalse(obj["promotion_authorized"])
                 self.assertFalse(obj["completion_authorized"])
-                self.assertEqual({x["name"] for x in obj["installed"]}, {p.replace("_", "-").lower() for p in roots})
+                self.assertEqual(
+                    {x["name"] for x in obj["installed"]},
+                    {p.replace("_", "-").lower() for p in roots},
+                )
                 self.assertEqual(obj["lock_sha256"], lock_hash)
                 self.assertEqual(len(obj["wheelhouse"]), len(roots))
 

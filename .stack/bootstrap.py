@@ -20,6 +20,8 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import zipfile
+from email.parser import BytesParser
 from pathlib import Path
 
 SCRIPT = Path(__file__).absolute()
@@ -33,9 +35,9 @@ LOCK_RE = re.compile(
     r"--hash=sha256:(?P<sha>[0-9a-f]{64})$"
 )
 ROOTS = {
-    "base": ("httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis"),
+    "base": ("pip", "httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis"),
     "mirofish": (
-        "httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis",
+        "pip", "httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis",
         "flask", "flask-cors", "openai", "zep-cloud", "camel-oasis", "camel-ai",
         "pymupdf", "charset-normalizer", "chardet",
     ),
@@ -46,9 +48,10 @@ SOURCES = {
     "camel": "https://github.com/camel-ai/camel",
 }
 
-# Runs inside the newly created, still-empty venv. It uses pip's vendored packaging
-# parser before any candidate wheel is installed, so wheel dependency metadata can
-# be validated without executing package code or permitting pip dependency traversal.
+# Runs inside the newly created, still-empty venv. The authenticated pip wheel is
+# inserted on sys.path only after its bytes/name/version have been bound to the
+# independently authenticated lock with stdlib-only parsing. Candidate wheels are
+# then parsed with pip's vendored PEP 508 implementation before any install.
 METADATA_VALIDATOR = r'''
 import hashlib
 import json
@@ -56,6 +59,9 @@ import sys
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
+
+pip_wheel = Path(sys.argv[2])
+sys.path.insert(0, str(pip_wheel))
 from pip._vendor.packaging.markers import default_environment
 from pip._vendor.packaging.requirements import Requirement
 from pip._vendor.packaging.utils import canonicalize_name
@@ -103,8 +109,6 @@ for locked_name, item in sorted(lock.items()):
     metadata[locked_name] = {"version": actual_version, "wheel_sha256": digest}
     requirements[locked_name] = list(msg.get_all("Requires-Dist", []))
 
-# Every lock entry is installed explicitly, so its base requirements are active.
-# Extras requested by dependency edges propagate to the target package until fixed.
 active_extras = {name: {""} for name in lock}
 env = default_environment()
 closure = []
@@ -151,6 +155,23 @@ print(json.dumps({
     "dependency_edges": sorted(closure, key=lambda x: (x["source"], x["requirement"], x["target"])),
     "dependency_traversal": False,
 }, sort_keys=True, separators=(",", ":")))
+'''
+
+ENV_AUDITOR = r'''
+import json
+import re
+from importlib.metadata import distributions
+def canonicalize_name(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+rows = {}
+for dist in distributions():
+    name = canonicalize_name(dist.metadata.get("Name", ""))
+    if not name:
+        raise SystemExit("installed distribution with no name")
+    if name in rows:
+        raise SystemExit(f"duplicate installed distribution: {name}")
+    rows[name] = dist.version
+print(json.dumps(rows, sort_keys=True, separators=(",", ":")))
 '''
 
 
@@ -295,6 +316,42 @@ def snapshot_wheels(
     return inv
 
 
+def _wheel_metadata_stdlib(wheel: Path) -> tuple[str, str]:
+    data = read_regular(wheel)
+    try:
+        with zipfile.ZipFile(__import__("io").BytesIO(data)) as zf:
+            members = zf.namelist()
+            for member in members:
+                parts = Path(member).parts
+                if member.startswith(("/", "\\")) or "\\" in member or ".." in parts:
+                    raise Refused(f"unsafe wheel member path: {wheel.name}:{member}")
+            metas = [m for m in members if len(Path(m).parts) == 2 and m.endswith(".dist-info/METADATA")]
+            if len(metas) != 1:
+                raise Refused(f"wheel must contain exactly one top-level METADATA: {wheel.name}")
+            msg = BytesParser().parsebytes(zf.read(metas[0]))
+    except zipfile.BadZipFile as exc:
+        raise Refused(f"invalid wheel archive: {wheel.name}") from exc
+    return norm(msg.get("Name", "")), str(msg.get("Version", ""))
+
+
+def locked_pip_wheel(
+    wheel_dir: Path, lock: dict[str, dict[str, str]], inv: list[dict[str, object]]
+) -> tuple[Path, str]:
+    item = lock.get("pip")
+    if not item:
+        raise Refused("complete lock must authenticate pip")
+    matches = [x for x in inv if str(x["sha256"]) == item["sha256"]]
+    if len(matches) != 1:
+        raise Refused("pip lock hash must resolve to exactly one snapshotted wheel")
+    wheel = wheel_dir / str(matches[0]["name"])
+    name, version = _wheel_metadata_stdlib(wheel)
+    if name != "pip" or version != item["version"]:
+        raise Refused(
+            f"authenticated installer wheel does not match pip lock: got {name or '<missing>'} {version or '<missing>'}"
+        )
+    return wheel, item["sha256"]
+
+
 def pip_env(venv_bin: Path) -> dict[str, str]:
     env = {
         "PATH": str(venv_bin) + os.pathsep + os.defpath,
@@ -319,16 +376,21 @@ def interpreter_identity() -> tuple[Path, str]:
 
 
 def validate_wheel_metadata(
-    py: Path, wheel_dir: Path, lock: dict[str, dict[str, str]], env: dict[str, str]
+    py: Path,
+    wheel_dir: Path,
+    pip_wheel: Path,
+    lock: dict[str, dict[str, str]],
+    env: dict[str, str],
 ) -> dict[str, object]:
     payload = json.dumps(lock, sort_keys=True, separators=(",", ":"))
     result = subprocess.run(
-        [str(py), "-I", "-c", METADATA_VALIDATOR, str(wheel_dir)],
+        [str(py), "-I", "-c", METADATA_VALIDATOR, str(wheel_dir), str(pip_wheel)],
         input=payload,
         text=True,
         capture_output=True,
         cwd=wheel_dir.parent,
         env=env,
+        timeout=120,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -340,6 +402,30 @@ def validate_wheel_metadata(
     if obj.get("dependency_traversal") is not False or not isinstance(obj.get("packages"), dict):
         raise Refused("wheel metadata validator returned invalid authority state")
     return obj
+
+
+def audit_environment(
+    py: Path, lock: dict[str, dict[str, str]], env: dict[str, str]
+) -> dict[str, str]:
+    result = subprocess.run(
+        [str(py), "-I", "-c", ENV_AUDITOR],
+        text=True,
+        capture_output=True,
+        cwd=py.parent.parent,
+        env=env,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise Refused("installed distribution audit failed: " + (detail or f"exit {result.returncode}"))
+    try:
+        actual = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise Refused("installed distribution audit returned invalid JSON") from exc
+    expected = {name: item["version"] for name, item in lock.items()}
+    if actual != expected:
+        raise Refused(f"installed distribution set differs from complete lock: expected {expected}, got {actual}")
+    return actual
 
 
 def verify_report(
@@ -383,10 +469,11 @@ def main() -> int:
         print(
             json.dumps(
                 {
-                    "schema": "amazingbecca-shared-composition-stack-v3-plan",
+                    "schema": "amazingbecca-shared-composition-stack-v4-plan",
                     "profile": a.profile,
                     "profile_roots": list(ROOTS[a.profile]),
                     "install": "offline-wheelhouse-only-no-deps",
+                    "installer": "hash-locked-pip-wheel-no-ensurepip",
                     "authority": "advisory-install-evidence-only",
                     "promotion_authorized": False,
                     "completion_authorized": False,
@@ -428,24 +515,26 @@ def main() -> int:
         write_new(stage / "lock.txt", lock_bytes, 0o400)
         wheel_dir = stage / "wheelhouse"
         inv = snapshot_wheels(a.wheelhouse, wheel_dir, lock)
+        pip_wheel, pip_wheel_hash = locked_pip_wheel(wheel_dir, lock, inv)
         env_dir = stage / "venv"
         env = pip_env(env_dir / "bin")
         subprocess.run(
-            [str(interp), "-I", "-m", "venv", "--copies", str(env_dir)],
+            [str(interp), "-I", "-m", "venv", "--without-pip", "--copies", str(env_dir)],
             check=True,
             cwd=stage,
             env=env,
+            timeout=120,
         )
         py = env_dir / "bin" / "python"
         if not py.is_file() or py.is_symlink():
             raise Refused("fresh venv interpreter missing or symlinked")
 
-        metadata = validate_wheel_metadata(py, wheel_dir, lock, env)
+        metadata = validate_wheel_metadata(py, wheel_dir, pip_wheel, lock, env)
         metadata_bytes = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
         report = stage / "pip-report.json"
         subprocess.run(
             [
-                str(py), "-I", "-m", "pip", "install", "--isolated",
+                str(py), str(pip_wheel) + "/pip", "install", "--isolated",
                 "--disable-pip-version-check", "--no-input", "--no-index",
                 "--only-binary=:all:", "--require-hashes", "--no-deps",
                 "--find-links", str(wheel_dir), "--report", str(report),
@@ -454,10 +543,12 @@ def main() -> int:
             check=True,
             cwd=stage,
             env=env,
+            timeout=600,
         )
         installed = verify_report(report, lock, inv)
+        environment_distributions = audit_environment(py, lock, env)
         receipt = {
-            "schema": "amazingbecca-shared-composition-stack-v3",
+            "schema": "amazingbecca-shared-composition-stack-v4",
             "authority": "advisory-install-evidence-only",
             "profile": a.profile,
             "profile_roots": list(ROOTS[a.profile]),
@@ -470,10 +561,15 @@ def main() -> int:
             "bootstrap_sha256": bootstrap_hash,
             "lock_sha256": expected,
             "wheelhouse": inv,
+            "installer": "hash-locked-pip-wheel-zipimport",
+            "installer_wheel_sha256": pip_wheel_hash,
+            "ensurepip_used": False,
             "dependency_metadata_sha256": h(metadata_bytes),
             "dependency_metadata_validated": True,
             "dependency_traversal": False,
             "installed": installed,
+            "environment_distributions": environment_distributions,
+            "environment_matches_complete_lock": True,
             "pip_report_sha256": h(read_regular(report)),
             "network_install": False,
             "source_distribution_builds": False,

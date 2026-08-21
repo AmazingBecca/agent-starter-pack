@@ -1,0 +1,161 @@
+name: Split accepted Ollama artifacts for transfer
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  split:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Download accepted Ollama runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: ollama-runtime
+          path: accepted/ollama-runtime
+          run-id: 30064225909
+          github-token: ${{ github.token }}
+
+      - name: Download accepted Ollama model
+        uses: actions/download-artifact@v4
+        with:
+          name: ollama-model-qwen3.5-2b
+          path: accepted/ollama-model
+          run-id: 30064225909
+          github-token: ${{ github.token }}
+
+      - name: Verify accepted archives and split below connector ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p transfer/runtime transfer/model transfer/manifest
+
+          verify_archive() {
+            local archive="$1"
+            local checksum_file="$2"
+            local expected actual
+            expected="$(awk '{print $1}' "$checksum_file")"
+            actual="$(sha256sum "$archive" | awk '{print $1}')"
+            printf 'archive=%s\nexpected=%s\nactual=%s\n' "$archive" "$expected" "$actual"
+            test "$expected" = "$actual"
+          }
+
+          verify_archive \
+            accepted/ollama-runtime/ollama-runtime.tar.zst \
+            accepted/ollama-runtime/ollama-runtime.tar.zst.sha256
+          verify_archive \
+            accepted/ollama-model/ollama-model-qwen3.5-2b.tar.zst \
+            accepted/ollama-model/ollama-model-qwen3.5-2b.tar.zst.sha256
+
+          split -b 400000000 -d -a 2 \
+            accepted/ollama-runtime/ollama-runtime.tar.zst \
+            transfer/runtime/ollama-runtime.tar.zst.part-
+          split -b 400000000 -d -a 2 \
+            accepted/ollama-model/ollama-model-qwen3.5-2b.tar.zst \
+            transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-
+
+          test "$(find transfer/runtime -type f | wc -l)" -eq 4
+          test "$(find transfer/model -type f | wc -l)" -eq 7
+
+          cp accepted/ollama-runtime/ollama-runtime.tar.zst.sha256 transfer/manifest/
+          cp accepted/ollama-model/ollama-model-qwen3.5-2b.tar.zst.sha256 transfer/manifest/
+          find transfer/runtime transfer/model -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > transfer/manifest/parts.sha256
+          find transfer/runtime transfer/model -type f -printf '%p %s bytes\n' \
+            | sort > transfer/manifest/parts.sizes
+
+      - name: Upload transfer manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-transfer-manifest
+          path: transfer/manifest/
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload runtime part 00
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-runtime-part-00
+          path: transfer/runtime/ollama-runtime.tar.zst.part-00
+          compression-level: 0
+          retention-days: 3
+      - name: Upload runtime part 01
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-runtime-part-01
+          path: transfer/runtime/ollama-runtime.tar.zst.part-01
+          compression-level: 0
+          retention-days: 3
+      - name: Upload runtime part 02
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-runtime-part-02
+          path: transfer/runtime/ollama-runtime.tar.zst.part-02
+          compression-level: 0
+          retention-days: 3
+      - name: Upload runtime part 03
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-runtime-part-03
+          path: transfer/runtime/ollama-runtime.tar.zst.part-03
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload model part 00
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-00
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-00
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 01
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-01
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-01
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 02
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-02
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-02
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 03
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-03
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-03
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 04
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-04
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-04
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 05
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-05
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-05
+          compression-level: 0
+          retention-days: 3
+      - name: Upload model part 06
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-model-part-06
+          path: transfer/model/ollama-model-qwen3.5-2b.tar.zst.part-06
+          compression-level: 0
+          retention-days: 3

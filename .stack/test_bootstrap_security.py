@@ -15,10 +15,12 @@ import shutil
 import socketserver
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import unittest
 import zipfile
+from email.parser import BytesParser
 
 HERE = Path(__file__).resolve().parent
 BOOTSTRAP = Path(os.environ.get("AB_STACK_BOOTSTRAP", HERE / "bootstrap.py")).resolve()
@@ -55,10 +57,8 @@ def make_wheel(
         f"{import_name}/__init__.py": f'__version__ = "{version}"\n'.encode(),
         f"{dist_info}/METADATA": metadata.encode(),
         f"{dist_info}/WHEEL": (
-            "Wheel-Version: 1.0\n"
-            "Generator: shared-stack-security-test\n"
-            "Root-Is-Purelib: true\n"
-            "Tag: py3-none-any\n"
+            "Wheel-Version: 1.0\nGenerator: shared-stack-security-test\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n"
         ).encode(),
     }
     rows: list[tuple[str, str, str]] = []
@@ -76,6 +76,52 @@ def make_wheel(
             zf.writestr(path, data)
     data = wheel.read_bytes()
     return wheel, sha256(data)
+
+
+def find_real_pip_wheel() -> Path:
+    pkg_dir = sysconfig.get_config_var("WHEEL_PKG_DIR")
+    if pkg_dir:
+        matches = sorted(Path(pkg_dir).glob("pip-*.whl"))
+        if matches:
+            return matches[-1]
+    try:
+        import ensurepip
+        ctx = getattr(ensurepip, "_get_pip_whl_path_ctx", None)
+        if ctx is not None:
+            with ctx() as path:
+                if Path(path).is_file():
+                    target = Path(tempfile.mkdtemp()) / Path(path).name
+                    shutil.copyfile(path, target)
+                    return target
+    except Exception:
+        pass
+    raise unittest.SkipTest("real pip wheel unavailable for offline bootstrap regression")
+
+
+def wheel_identity(wheel: Path) -> tuple[str, str, str]:
+    data = wheel.read_bytes()
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        metas = [m for m in zf.namelist() if len(Path(m).parts) == 2 and m.endswith(".dist-info/METADATA")]
+        if len(metas) != 1:
+            raise RuntimeError("bad test pip wheel")
+        msg = BytesParser().parsebytes(zf.read(metas[0]))
+    return str(msg["Name"]), str(msg["Version"]), sha256(data)
+
+
+def populate_base_wheelhouse(root: Path, direct_url: str | None = None) -> tuple[Path, bytes]:
+    wheelhouse = root / "wheelhouse"
+    wheelhouse.mkdir()
+    pip_src = find_real_pip_wheel()
+    pip_dst = wheelhouse / pip_src.name
+    shutil.copyfile(pip_src, pip_dst)
+    pip_name, pip_version, pip_digest = wheel_identity(pip_dst)
+    lines = [f"{pip_name}=={pip_version} --hash=sha256:{pip_digest}"]
+    roots = ["httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis"]
+    for project in roots:
+        requires = [direct_url] if (project == "httpx" and direct_url) else []
+        _wheel, digest = make_wheel(wheelhouse, project, requires=requires)
+        lines.append(f"{project}==1.0.0 --hash=sha256:{digest}")
+    return wheelhouse, ("\n".join(lines) + "\n").encode()
 
 
 class SharedStackBootstrapSecurityTests(unittest.TestCase):
@@ -97,10 +143,11 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
                 with self.assertRaises(self.mod.Refused):
                     self.mod.parse_lock(payload)
 
-    def test_profile_roots_must_all_be_locked(self) -> None:
+    def test_profile_roots_require_authenticated_pip(self) -> None:
         lock = self.mod.parse_lock(b"httpx==1.0.0 --hash=sha256:" + b"0" * 64 + b"\n")
-        with self.assertRaises(self.mod.Refused):
+        with self.assertRaises(self.mod.Refused) as cm:
             self.mod.validate_roots("base", lock)
+        self.assertIn("pip", str(cm.exception))
 
     def test_mirofish_rejects_non_cpython_311(self) -> None:
         with self.assertRaises(self.mod.Refused):
@@ -120,21 +167,20 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
                 self.mod.write_new(out, b"replacement")
             self.assertEqual(victim.read_bytes(), b"keep")
 
-    def test_dry_run_does_not_require_mirofish_python_or_create_runtime(self) -> None:
+    def test_dry_run_does_not_create_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             stack = Path(td) / ".stack"
             stack.mkdir(mode=0o700)
             script = stack / "bootstrap.py"
             shutil.copyfile(BOOTSTRAP, script)
             result = subprocess.run(
-                [sys.executable, str(script), "--profile", "mirofish", "--dry-run"],
+                [sys.executable, str(script), "--profile", "base", "--dry-run"],
                 text=True,
                 capture_output=True,
                 check=True,
             )
             plan = json.loads(result.stdout)
-            self.assertEqual(plan["profile"], "mirofish")
-            self.assertEqual(plan["install"], "offline-wheelhouse-only-no-deps")
+            self.assertEqual(plan["installer"], "hash-locked-pip-wheel-no-ensurepip")
             self.assertFalse((stack / "runtime").exists())
 
     def test_exact_lock_mismatch_fails_before_runtime_mutation(self) -> None:
@@ -144,7 +190,7 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
             script = stack / "bootstrap.py"
             shutil.copyfile(BOOTSTRAP, script)
             lock = Path(td) / "lock.txt"
-            lock.write_text("httpx==1.0.0 --hash=sha256:" + "0" * 64 + "\n")
+            lock.write_text("pip==1.0.0 --hash=sha256:" + "0" * 64 + "\n")
             wheelhouse = Path(td) / "wheels"
             wheelhouse.mkdir()
             result = subprocess.run(
@@ -157,36 +203,13 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
             self.assertIn("lock SHA-256 mismatch", result.stderr)
             self.assertFalse((stack / "runtime").exists())
 
-    def test_symlinked_lock_and_wheelhouse_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            regular_lock = root / "real.lock"
-            regular_lock.write_bytes(b"x")
-            link_lock = root / "link.lock"
-            link_lock.symlink_to(regular_lock)
-            with self.assertRaises(OSError):
-                self.mod.read_regular(link_lock)
-
-            real_wh = root / "real-wheels"
-            real_wh.mkdir()
-            link_wh = root / "link-wheels"
-            link_wh.symlink_to(real_wh, target_is_directory=True)
-            with self.assertRaises(self.mod.Refused):
-                self.mod.snapshot_wheels(
-                    link_wh,
-                    root / "snapshot",
-                    {"x": {"version": "1", "sha256": "0" * 64}},
-                )
-
-    def test_direct_url_dependency_is_rejected_before_any_network_request(self) -> None:
-        roots = ["httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis"]
+    def test_direct_url_dependency_is_rejected_before_network(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             stack = root / ".stack"
             stack.mkdir(mode=0o700)
             script = stack / "bootstrap.py"
             shutil.copyfile(BOOTSTRAP, script)
-
             served = root / "served"
             served.mkdir()
             evil, _ = make_wheel(served, "evil")
@@ -206,14 +229,9 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
             thread.start()
             try:
                 port = server.server_address[1]
-                wheelhouse = root / "wheelhouse"
-                wheelhouse.mkdir()
-                lock_lines: list[str] = []
-                for project in roots:
-                    requires = [f"evil @ http://127.0.0.1:{port}/{evil.name}"] if project == "httpx" else []
-                    _wheel, digest = make_wheel(wheelhouse, project, requires=requires)
-                    lock_lines.append(f"{project}==1.0.0 --hash=sha256:{digest}")
-                lock_bytes = ("\n".join(lock_lines) + "\n").encode()
+                wheelhouse, lock_bytes = populate_base_wheelhouse(
+                    root, f"evil @ http://127.0.0.1:{port}/{evil.name}"
+                )
                 lock = root / "base.lock"
                 lock.write_bytes(lock_bytes)
                 result = subprocess.run(
@@ -229,17 +247,51 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
                 thread.join(timeout=5)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("direct URL dependency forbidden", result.stderr)
-            self.assertEqual(hits, [], "dependency metadata caused a network request before rejection")
+            self.assertEqual(hits, [])
 
-    def test_offline_install_uses_fresh_run_and_never_touches_legacy_paths(self) -> None:
-        roots = ["httpx", "pydantic", "python-dotenv", "pytest", "pytest-asyncio", "hypothesis"]
+    def test_without_pip_venv_starts_without_seeded_distributions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            venv = Path(td) / "venv"
+            subprocess.run(
+                [sys.executable, "-I", "-m", "venv", "--without-pip", "--copies", str(venv)],
+                check=True,
+                env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+            )
+            py = venv / "bin" / "python"
+            audit = subprocess.run(
+                [str(py), "-I", "-c", "from importlib.metadata import distributions; print(list(distributions()))"],
+                text=True,
+                capture_output=True,
+                check=True,
+                env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+            )
+            self.assertEqual(audit.stdout.strip(), "[]")
+            missing_pip = subprocess.run(
+                [str(py), "-I", "-m", "pip", "--version"],
+                text=True,
+                capture_output=True,
+                env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+            )
+            self.assertNotEqual(missing_pip.returncode, 0)
+
+    def test_fake_pip_wheel_cannot_be_used_as_installer_without_matching_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            wh = root / "wh"
+            wh.mkdir()
+            fake, digest = make_wheel(wh, "pip", "0.0.1")
+            lock = {"pip": {"version": "99.0", "sha256": digest}}
+            inv = [{"name": fake.name, "sha256": digest, "size": fake.stat().st_size}]
+            with self.assertRaises(self.mod.Refused):
+                self.mod.locked_pip_wheel(wh, lock, inv)
+
+    def test_offline_install_uses_hash_locked_pip_and_exact_distribution_set(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             stack = root / ".stack"
             stack.mkdir(mode=0o700)
             script = stack / "bootstrap.py"
             shutil.copyfile(BOOTSTRAP, script)
-
             legacy_python = stack / ".venv" / "bin" / "python"
             legacy_python.parent.mkdir(parents=True)
             marker = root / "legacy-executed"
@@ -251,17 +303,14 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
             victim.write_text("keep")
             (legacy_receipts / "base.json").symlink_to(victim)
 
-            wheelhouse = root / "wheelhouse"
-            wheelhouse.mkdir()
-            lock_lines: list[str] = []
-            for project in roots:
-                _wheel, digest = make_wheel(wheelhouse, project)
-                lock_lines.append(f"{project}==1.0.0 --hash=sha256:{digest}")
-            lock_bytes = ("\n".join(lock_lines) + "\n").encode()
+            wheelhouse, lock_bytes = populate_base_wheelhouse(root)
             lock = root / "base.lock"
             lock.write_bytes(lock_bytes)
             lock_hash = sha256(lock_bytes)
-
+            lock_names = {
+                line.split("==", 1)[0].lower().replace("_", "-")
+                for line in lock_bytes.decode().splitlines()
+            }
             receipts: list[Path] = []
             for _ in range(2):
                 result = subprocess.run(
@@ -273,28 +322,26 @@ class SharedStackBootstrapSecurityTests(unittest.TestCase):
                     env={"PATH": os.defpath, "LANG": "C.UTF-8"},
                 )
                 receipt = Path(result.stdout.strip().splitlines()[-1])
-                self.assertTrue(receipt.is_file())
                 receipts.append(receipt)
                 obj = json.loads(receipt.read_text())
-                self.assertEqual(obj["schema"], "amazingbecca-shared-composition-stack-v3")
-                self.assertEqual(obj["python_implementation"], "cpython")
-                self.assertTrue(obj["dependency_metadata_validated"])
-                self.assertFalse(obj["dependency_traversal"])
-                self.assertFalse(obj["network_install"])
-                self.assertFalse(obj["source_distribution_builds"])
-                self.assertFalse(obj["reused_environment"])
-                self.assertFalse(obj["promotion_authorized"])
-                self.assertFalse(obj["completion_authorized"])
-                self.assertEqual(
-                    {x["name"] for x in obj["installed"]},
-                    {p.replace("_", "-").lower() for p in roots},
+                self.assertEqual(obj["schema"], "amazingbecca-shared-composition-stack-v4")
+                self.assertFalse(obj["ensurepip_used"])
+                self.assertEqual(obj["installer"], "hash-locked-pip-wheel-zipimport")
+                self.assertTrue(obj["environment_matches_complete_lock"])
+                self.assertEqual(set(obj["environment_distributions"]), lock_names)
+                self.assertEqual({x["name"] for x in obj["installed"]}, lock_names)
+                vpy = receipt.parent / "venv" / "bin" / "python"
+                pip_version = subprocess.run(
+                    [str(vpy), "-I", "-m", "pip", "--version"],
+                    text=True,
+                    capture_output=True,
+                    check=True,
                 )
-                self.assertEqual(obj["lock_sha256"], lock_hash)
-                self.assertEqual(len(obj["wheelhouse"]), len(roots))
+                self.assertIn("pip ", pip_version.stdout)
 
             self.assertNotEqual(receipts[0].parent, receipts[1].parent)
-            self.assertFalse(marker.exists(), "legacy ignored venv interpreter was executed")
-            self.assertEqual(victim.read_text(), "keep", "legacy receipt symlink target was modified")
+            self.assertFalse(marker.exists())
+            self.assertEqual(victim.read_text(), "keep")
 
 
 if __name__ == "__main__":

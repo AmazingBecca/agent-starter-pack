@@ -17,7 +17,7 @@ import unittest
 import zipfile
 
 HERE = Path(__file__).resolve().parent
-BOOTSTRAP = Path(os.environ.get("AB_STACK_BOOTSTRAP", HERE / "bootstrap_v2.py")).resolve()
+BOOTSTRAP = Path(os.environ.get("AB_STACK_BOOTSTRAP", HERE / "bootstrap.py")).resolve()
 
 
 def sha256(data: bytes) -> str:
